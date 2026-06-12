@@ -78,3 +78,7 @@ For Icinga 2, store the API token in a `vars` custom variable or use Icinga's se
 ## Performance data
 
 `zones=`, `traffic_kqr=`, and `days_to_reset=` are emitted in standard Nagios perfdata format for use with PNP4Nagios, Graphite, or similar.
+
+## Generated with
+
+This code was generated with [Claude Code](https://claude.ai/code) (Sonnet 4.8).
