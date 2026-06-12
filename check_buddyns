@@ -1,0 +1,210 @@
+#!/bin/bash
+#
+# check_buddyns - Nagios/Icinga plugin for BuddyNS secondary DNS
+#
+# Checks:
+#   zones   — zones in use vs. plan limit              (/api/v2/zone/, /api/v2/service/)
+#   traffic — monthly traffic in Kqr vs. plan quota    (/api/v2/user/profile/, /api/v2/service/)
+#             (Kqr = kilo-queries; API field used_traffic is raw queries, quota is in Kqr)
+#   reset   — days until monthly counters reset (computed: days left in calendar month)
+#
+# BuddyNS API v2: https://www.buddyns.com/api/v2/
+# Auth: API token (preferred) or username:password
+#
+
+PROGNAME="check_buddyns"
+VERSION="1.2.0"
+API_BASE="https://www.buddyns.com/api/v2"
+
+OK=0; WARNING=1; CRITICAL=2; UNKNOWN=3
+
+# Default thresholds (% of plan limit)
+WARN_ZONES=80; CRIT_ZONES=90
+WARN_TRAF=80;  CRIT_TRAF=90
+API_KEY=""; USERNAME=""; PASSWORD=""
+
+usage() {
+    cat <<EOF
+Usage: $PROGNAME {-k <api_token> | -u <user> -p <pass>}
+                 [-w <zones_warn%>] [-c <zones_crit%>]
+                 [-W <traffic_warn%>] [-C <traffic_crit%>]
+                 [-h] [-V]
+EOF
+}
+
+help() {
+    usage
+    cat <<EOF
+
+Nagios plugin for BuddyNS (buddyns.com) — zones and monthly traffic quota monitoring.
+
+  -k  API token (from Account > API Key in the BuddyNS dashboard)
+  -u  Username (email address), used together with -p
+  -p  Password, used together with -u
+  -w  Zones used warning  threshold, % of plan limit  (default: 80)
+  -c  Zones used critical threshold, % of plan limit  (default: 90)
+  -W  Traffic warning  threshold, % of monthly quota  (default: 80)
+  -C  Traffic critical threshold, % of monthly quota  (default: 90)
+  -h  Show this help
+  -V  Show version ($VERSION)
+
+Exit codes: 0=OK, 1=WARNING, 2=CRITICAL, 3=UNKNOWN (standard Nagios convention).
+Performance data zones=, traffic_kqr=, and days_to_reset= are emitted for graphing.
+
+Note: BuddyNS API v2 exposes monthly traffic in kilo-queries (Kqr), not per-second rates.
+      used_traffic from /user/profile/ is raw queries (÷1000 = Kqr); traffic_quota from
+      /service/ is already in Kqr. Days to reset = days remaining in the calendar month.
+EOF
+}
+
+while getopts ":k:u:p:w:c:W:C:hV" opt; do
+    case "$opt" in
+        k) API_KEY="$OPTARG"    ;;
+        u) USERNAME="$OPTARG"   ;;
+        p) PASSWORD="$OPTARG"   ;;
+        w) WARN_ZONES="$OPTARG" ;;
+        c) CRIT_ZONES="$OPTARG" ;;
+        W) WARN_TRAF="$OPTARG"  ;;
+        C) CRIT_TRAF="$OPTARG"  ;;
+        h) help; exit $OK       ;;
+        V) echo "$PROGNAME v$VERSION"; exit $OK ;;
+        :) echo "UNKNOWN: -$OPTARG requires an argument"; usage; exit $UNKNOWN ;;
+        *) echo "UNKNOWN: unknown option -$OPTARG";       usage; exit $UNKNOWN ;;
+    esac
+done
+
+# --- Validate auth -----------------------------------------------------------
+
+if [ -z "$API_KEY" ] && [ -z "$USERNAME" ]; then
+    echo "UNKNOWN: authentication required (-k api_token  or  -u user -p pass)"
+    usage; exit $UNKNOWN
+fi
+if [ -z "$API_KEY" ] && [ -n "$USERNAME" ] && [ -z "$PASSWORD" ]; then
+    echo "UNKNOWN: -p password required when using -u"
+    usage; exit $UNKNOWN
+fi
+
+# --- Validate thresholds -----------------------------------------------------
+
+for pair in "${WARN_ZONES}:${CRIT_ZONES}" "${WARN_TRAF}:${CRIT_TRAF}"; do
+    w="${pair%%:*}"; c="${pair##*:}"
+    if ! [[ "$w" =~ ^[0-9]+$ ]] || ! [[ "$c" =~ ^[0-9]+$ ]]; then
+        echo "UNKNOWN: thresholds must be integers (0-100)"; exit $UNKNOWN
+    fi
+    if [ "$w" -ge "$c" ]; then
+        echo "UNKNOWN: warning threshold must be less than critical"; exit $UNKNOWN
+    fi
+done
+
+# --- Dependency check --------------------------------------------------------
+
+for cmd in curl jq awk; do
+    command -v "$cmd" &>/dev/null || { echo "UNKNOWN: '$cmd' not found in PATH"; exit $UNKNOWN; }
+done
+
+# --- API helper --------------------------------------------------------------
+
+if [ -n "$API_KEY" ]; then
+    CURL_AUTH=(-H "Authorization: Token $API_KEY")
+else
+    CURL_AUTH=(--user "$USERNAME:$PASSWORD")
+fi
+
+api_get() {
+    local path="$1" out http_code body
+    out=$(curl -s --max-time 30 \
+        "${CURL_AUTH[@]}" \
+        -H "Accept: application/json" \
+        -w "\n%{http_code}" \
+        "${API_BASE}/${path}" 2>&1)
+    http_code="${out##*$'\n'}"
+    body="${out%$'\n'*}"
+    if [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; then
+        echo "UNKNOWN: authentication failed (HTTP $http_code) — check -k / -u / -p"
+        exit $UNKNOWN
+    fi
+    if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+        echo "UNKNOWN: BuddyNS API returned HTTP $http_code for /${path}"
+        exit $UNKNOWN
+    fi
+    echo "$body"
+}
+
+# --- Math helpers ------------------------------------------------------------
+
+pct_int() {
+    # integer percentage: used / max * 100, 0 when max=0
+    awk -v u="$1" -v m="$2" 'BEGIN { printf "%d", (m>0) ? u*100/m : 0 }'
+}
+
+abs_thr() {
+    # absolute threshold from a percentage of max (1 decimal)
+    awk -v m="$1" -v p="$2" 'BEGIN { printf "%.1f", m*p/100 }'
+}
+
+threshold_state() {
+    awk -v v="$1" -v w="$2" -v c="$3" \
+        'BEGIN { if (v>=c) print "CRITICAL"; else if (v>=w) print "WARNING"; else print "OK" }'
+}
+
+worst_state() {
+    for s in "$@"; do [ "$s" = "CRITICAL" ] && { echo "CRITICAL"; return; }; done
+    for s in "$@"; do [ "$s" = "WARNING"  ] && { echo "WARNING";  return; }; done
+    echo "OK"
+}
+
+# --- Fetch data --------------------------------------------------------------
+
+# /zone/ returns a plain JSON array
+ZONES_JSON=$(api_get "zone/")
+ZONES_USED=$(echo "$ZONES_JSON" | jq 'length')
+if [ -z "$ZONES_USED" ]; then
+    echo "UNKNOWN: unexpected response from /zone/"
+    exit $UNKNOWN
+fi
+
+# /service/ holds plan limits: num_zones (count) and traffic_quota (MB/month)
+SERVICE_JSON=$(api_get "service/")
+ZONES_MAX=$(echo "$SERVICE_JSON"   | jq -r '.num_zones      // 0')
+TRAFFIC_MAX_MB=$(echo "$SERVICE_JSON" | jq -r '.traffic_quota // 0')
+
+# /user/profile/ holds current-month usage in bytes
+PROFILE_JSON=$(api_get "user/profile/")
+TRAFFIC_USED_BYTES=$(echo "$PROFILE_JSON" | jq -r '.used_traffic      // 0')
+TRAFFIC_EST_BYTES=$(echo  "$PROFILE_JSON" | jq -r '.estimated_traffic // 0')
+
+# Convert raw queries → Kqr (1 decimal place)
+TRAFFIC_USED_KQR=$(awk -v b="$TRAFFIC_USED_BYTES" 'BEGIN { printf "%.1f", b/1000 }')
+TRAFFIC_EST_KQR=$(awk  -v b="$TRAFFIC_EST_BYTES"  'BEGIN { printf "%.1f", b/1000 }')
+
+# Days remaining in current calendar month (reset happens at month boundary)
+DAYS_TO_RESET=$(( ( $(date -d "$(date +%Y-%m-01) +1 month" +%s) - $(date +%s) ) / 86400 ))
+
+# --- Evaluate ----------------------------------------------------------------
+
+PCT_ZONES=$(pct_int "$ZONES_USED"      "$ZONES_MAX")
+PCT_TRAF=$(pct_int  "$TRAFFIC_USED_KQR" "$TRAFFIC_MAX_MB")
+
+STATE_ZONES=$(threshold_state "$PCT_ZONES" "$WARN_ZONES" "$CRIT_ZONES")
+STATE_TRAF=$( threshold_state "$PCT_TRAF"  "$WARN_TRAF"  "$CRIT_TRAF")
+OVERALL=$(worst_state "$STATE_ZONES" "$STATE_TRAF")
+
+# --- Performance data --------------------------------------------------------
+
+WARN_Z=$(abs_thr "$ZONES_MAX"      "$WARN_ZONES")
+CRIT_Z=$(abs_thr "$ZONES_MAX"      "$CRIT_ZONES")
+WARN_T=$(abs_thr "$TRAFFIC_MAX_MB" "$WARN_TRAF")
+CRIT_T=$(abs_thr "$TRAFFIC_MAX_MB" "$CRIT_TRAF")
+
+PERFDATA="zones=${ZONES_USED};${WARN_Z};${CRIT_Z};0;${ZONES_MAX} traffic_kqr=${TRAFFIC_USED_KQR};${WARN_T};${CRIT_T};0;${TRAFFIC_MAX_MB} days_to_reset=${DAYS_TO_RESET}"
+
+# --- Output ------------------------------------------------------------------
+
+echo "${OVERALL}: zones ${ZONES_USED}/${ZONES_MAX} (${PCT_ZONES}%), traffic ${TRAFFIC_USED_KQR}/${TRAFFIC_MAX_MB} Kqr (${PCT_TRAF}%, est. ${TRAFFIC_EST_KQR} Kqr), reset in ${DAYS_TO_RESET}d | ${PERFDATA}"
+
+case "$OVERALL" in
+    OK)       exit $OK       ;;
+    WARNING)  exit $WARNING  ;;
+    CRITICAL) exit $CRITICAL ;;
+    *)        exit $UNKNOWN  ;;
+esac
