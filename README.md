@@ -58,6 +58,10 @@ define service {
 
 For Icinga 2, store the API token in a `vars` custom variable or use Icinga's secret store rather than embedding it directly in the config.
 
+## Screenshot
+
+![BuddyNS monthly traffic graph](buddyns.png)
+
 ## References
 
 - [BuddyNS RESTful API v2 documentation](https://www.buddyns.com/support/api/v2/)
