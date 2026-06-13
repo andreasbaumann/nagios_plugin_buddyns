@@ -81,4 +81,4 @@ For Icinga 2, store the API token in a `vars` custom variable or use Icinga's se
 
 ## Generated with
 
-This code was generated with [Claude Code](https://claude.ai/code) (Sonnet 4.8).
+This code was generated with [Claude Code](https://claude.ai/code) (Sonnet 4.6).
