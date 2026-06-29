@@ -10,6 +10,7 @@ Monitors zones in use vs. plan limit and monthly query traffic vs. quota, with c
 - curl
 - jq
 - awk
+- GNU or BSD `date` (standard on Linux and macOS)
 
 ## Installation
 
@@ -25,6 +26,7 @@ chmod +x /usr/lib/nagios/plugins/check_buddyns
 check_buddyns -k <api_token>
 
 # Username + password
+# Note: password is visible in the process list; use -k api_token where possible
 check_buddyns -u user@example.com -p secret
 
 # Custom thresholds: warn at 70%, critical at 85% for both zones and traffic
